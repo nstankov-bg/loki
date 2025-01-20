@@ -10,15 +10,15 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/storage/chunk/cache/resultscache"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache/resultscache"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logqlmodel/stats"
-	"github.com/grafana/loki/pkg/querier/queryrange/queryrangebase"
-	"github.com/grafana/loki/pkg/storage/chunk/cache"
-	"github.com/grafana/loki/pkg/storage/stores/index/seriesvolume"
-	"github.com/grafana/loki/pkg/util"
-	"github.com/grafana/loki/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
+	"github.com/grafana/loki/v3/pkg/storage/stores/index/seriesvolume"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/constants"
 )
 
 func TestVolumeCache(t *testing.T) {
@@ -37,6 +37,7 @@ func TestVolumeCache(t *testing.T) {
 			WithSplitByLimits(fakeLimits{}, 24*time.Hour),
 			DefaultCodec,
 			c,
+			nil,
 			nil,
 			nil,
 			func(_ context.Context, _ []string, _ queryrangebase.Request) int {
@@ -302,6 +303,7 @@ func TestVolumeCache_RecentData(t *testing.T) {
 				WithSplitByLimits(lim, 24*time.Hour),
 				DefaultCodec,
 				c,
+				nil,
 				nil,
 				nil,
 				func(_ context.Context, _ []string, _ queryrangebase.Request) int {

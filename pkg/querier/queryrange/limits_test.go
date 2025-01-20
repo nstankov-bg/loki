@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -16,15 +17,17 @@ import (
 	"go.uber.org/atomic"
 	"gopkg.in/yaml.v2"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql/syntax"
-	"github.com/grafana/loki/pkg/logqlmodel"
-	"github.com/grafana/loki/pkg/querier/plan"
-	base "github.com/grafana/loki/pkg/querier/queryrange/queryrangebase"
-	"github.com/grafana/loki/pkg/storage/config"
-	"github.com/grafana/loki/pkg/util/constants"
-	util_log "github.com/grafana/loki/pkg/util/log"
-	"github.com/grafana/loki/pkg/util/math"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	base "github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	"github.com/grafana/loki/v3/pkg/storage/types"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/util/math"
 )
 
 func TestLimits(t *testing.T) {
@@ -48,8 +51,97 @@ func TestLimits(t *testing.T) {
 	require.Equal(
 		t,
 		fmt.Sprintf("%s:%s:%d:%d:%d", "a", r.GetQuery(), r.GetStep(), r.GetStart().UnixMilli()/int64(time.Hour/time.Millisecond), int64(time.Hour)),
-		cacheKeyLimits{wrapped, nil}.GenerateCacheKey(context.Background(), "a", r),
+		cacheKeyLimits{wrapped, nil, nil}.GenerateCacheKey(context.Background(), "a", r),
 	)
+}
+
+func TestMetricQueryCacheKey(t *testing.T) {
+	const (
+		defaultTenant       = "a"
+		alternateTenant     = "b"
+		query               = `sum(rate({foo="bar"}[1]))`
+		defaultSplit        = time.Hour
+		ingesterSplit       = 90 * time.Minute
+		ingesterQueryWindow = defaultSplit * 3
+	)
+
+	var (
+		step = (15 * time.Second).Milliseconds()
+	)
+
+	l := fakeLimits{
+		splitDuration:         map[string]time.Duration{defaultTenant: defaultSplit, alternateTenant: defaultSplit},
+		ingesterSplitDuration: map[string]time.Duration{defaultTenant: ingesterSplit},
+	}
+
+	cases := []struct {
+		name, tenantID string
+		start, end     time.Time
+		expectedSplit  time.Duration
+		iqo            util.IngesterQueryOptions
+	}{
+		{
+			name:          "outside ingester query window",
+			tenantID:      defaultTenant,
+			start:         time.Now().Add(-6 * time.Hour),
+			end:           time.Now().Add(-5 * time.Hour),
+			expectedSplit: defaultSplit,
+			iqo: ingesterQueryOpts{
+				queryIngestersWithin: ingesterQueryWindow,
+				queryStoreOnly:       false,
+			},
+		},
+		{
+			name:          "within ingester query window",
+			tenantID:      defaultTenant,
+			start:         time.Now().Add(-6 * time.Hour),
+			end:           time.Now().Add(-ingesterQueryWindow / 2),
+			expectedSplit: ingesterSplit,
+			iqo: ingesterQueryOpts{
+				queryIngestersWithin: ingesterQueryWindow,
+				queryStoreOnly:       false,
+			},
+		},
+		{
+			name:          "within ingester query window, but query store only",
+			tenantID:      defaultTenant,
+			start:         time.Now().Add(-6 * time.Hour),
+			end:           time.Now().Add(-ingesterQueryWindow / 2),
+			expectedSplit: defaultSplit,
+			iqo: ingesterQueryOpts{
+				queryIngestersWithin: ingesterQueryWindow,
+				queryStoreOnly:       true,
+			},
+		},
+		{
+			name:          "within ingester query window, but no ingester split duration configured",
+			tenantID:      alternateTenant,
+			start:         time.Now().Add(-6 * time.Hour),
+			end:           time.Now().Add(-ingesterQueryWindow / 2),
+			expectedSplit: defaultSplit,
+			iqo: ingesterQueryOpts{
+				queryIngestersWithin: ingesterQueryWindow,
+				queryStoreOnly:       false,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			keyGen := cacheKeyLimits{l, nil, tc.iqo}
+
+			r := &LokiRequest{
+				Query:   query,
+				StartTs: tc.start,
+				EndTs:   tc.end,
+				Step:    step,
+			}
+
+			// we use regex here because cache key always refers to the current time to get the ingester query window,
+			// and therefore we can't know the current interval apriori without duplicating the logic
+			pattern := regexp.MustCompile(fmt.Sprintf(`%s:%s:%d:(\d+):%d`, tc.tenantID, regexp.QuoteMeta(query), step, tc.expectedSplit))
+			require.Regexp(t, pattern, keyGen.GenerateCacheKey(context.Background(), tc.tenantID, r))
+		})
+	}
 }
 
 func Test_seriesLimiter(t *testing.T) {
@@ -58,7 +150,7 @@ func Test_seriesLimiter(t *testing.T) {
 	cfg.CacheIndexStatsResults = false
 	// split in 7 with 2 in // max.
 	l := WithSplitByLimits(fakeLimits{maxSeries: 1, maxQueryParallelism: 2}, time.Hour)
-	tpw, stopper, err := NewMiddleware(cfg, testEngineOpts, util_log.Logger, l, config.SchemaConfig{
+	tpw, stopper, err := NewMiddleware(cfg, testEngineOpts, nil, util_log.Logger, l, config.SchemaConfig{
 		Configs: testSchemas,
 	}, nil, false, nil, constants.Loki)
 	if stopper != nil {
@@ -149,14 +241,14 @@ func Test_MaxQueryParallelism(t *testing.T) {
 		defer count.Dec()
 		// simulate some work
 		time.Sleep(20 * time.Millisecond)
-		return base.NewEmptyPrometheusResponse(), nil
+		return base.NewEmptyPrometheusResponse(model.ValMatrix), nil
 	})
 	ctx := user.InjectOrgID(context.Background(), "foo")
 
 	_, _ = NewLimitedRoundTripper(h, fakeLimits{maxQueryParallelism: maxQueryParallelism},
 		testSchemas,
 		base.MiddlewareFunc(func(next base.Handler) base.Handler {
-			return base.HandlerFunc(func(c context.Context, r base.Request) (base.Response, error) {
+			return base.HandlerFunc(func(c context.Context, _ base.Request) (base.Response, error) {
 				var wg sync.WaitGroup
 				for i := 0; i < 10; i++ {
 					wg.Add(1)
@@ -180,7 +272,7 @@ func Test_MaxQueryParallelismLateScheduling(t *testing.T) {
 	h := base.HandlerFunc(func(_ context.Context, _ base.Request) (base.Response, error) {
 		// simulate some work
 		time.Sleep(20 * time.Millisecond)
-		return base.NewEmptyPrometheusResponse(), nil
+		return base.NewEmptyPrometheusResponse(model.ValMatrix), nil
 	})
 	ctx := user.InjectOrgID(context.Background(), "foo")
 
@@ -207,14 +299,14 @@ func Test_MaxQueryParallelismDisable(t *testing.T) {
 	h := base.HandlerFunc(func(_ context.Context, _ base.Request) (base.Response, error) {
 		// simulate some work
 		time.Sleep(20 * time.Millisecond)
-		return base.NewEmptyPrometheusResponse(), nil
+		return base.NewEmptyPrometheusResponse(model.ValMatrix), nil
 	})
 	ctx := user.InjectOrgID(context.Background(), "foo")
 
 	_, err := NewLimitedRoundTripper(h, fakeLimits{maxQueryParallelism: maxQueryParallelism},
 		testSchemas,
 		base.MiddlewareFunc(func(next base.Handler) base.Handler {
-			return base.HandlerFunc(func(c context.Context, r base.Request) (base.Response, error) {
+			return base.HandlerFunc(func(c context.Context, _ base.Request) (base.Response, error) {
 				for i := 0; i < 10; i++ {
 					go func() {
 						_, _ = next.Do(c, &LokiRequest{})
@@ -228,7 +320,7 @@ func Test_MaxQueryParallelismDisable(t *testing.T) {
 }
 
 func Test_MaxQueryLookBack(t *testing.T) {
-	tpw, stopper, err := NewMiddleware(testConfig, testEngineOpts, util_log.Logger, fakeLimits{
+	tpw, stopper, err := NewMiddleware(testConfig, testEngineOpts, nil, util_log.Logger, fakeLimits{
 		maxQueryLookback:    1 * time.Hour,
 		maxQueryParallelism: 1,
 	}, config.SchemaConfig{
@@ -308,7 +400,7 @@ func Test_MaxQueryLookBack_Types(t *testing.T) {
 }
 
 func Test_GenerateCacheKey_NoDivideZero(t *testing.T) {
-	l := cacheKeyLimits{WithSplitByLimits(nil, 0), nil}
+	l := cacheKeyLimits{WithSplitByLimits(nil, 0), nil, nil}
 	start := time.Now()
 	r := &LokiRequest{
 		Query:   "qry",
@@ -419,7 +511,7 @@ func Test_WeightedParallelism_DivideByZeroError(t *testing.T) {
 				From: config.DayTime{
 					Time: borderTime.Add(-1 * time.Hour),
 				},
-				IndexType: config.TSDBType,
+				IndexType: types.TSDBType,
 			},
 		}
 
@@ -437,7 +529,7 @@ func Test_WeightedParallelism_DivideByZeroError(t *testing.T) {
 				From: config.DayTime{
 					Time: borderTime.Add(-1 * time.Hour),
 				},
-				IndexType: config.TSDBType,
+				IndexType: types.TSDBType,
 			},
 		}
 
@@ -455,7 +547,7 @@ func Test_WeightedParallelism_DivideByZeroError(t *testing.T) {
 				From: config.DayTime{
 					Time: borderTime.Add(-1 * time.Hour),
 				},
-				IndexType: config.TSDBType,
+				IndexType: types.TSDBType,
 			},
 		}
 
@@ -471,12 +563,12 @@ func Test_MaxQuerySize(t *testing.T) {
 		{
 			// BoltDB -> Time -4 days
 			From:      config.DayTime{Time: model.TimeFromUnix(testTime.Add(-96 * time.Hour).Unix())},
-			IndexType: config.BoltDBShipperType,
+			IndexType: types.BoltDBShipperType,
 		},
 		{
 			// TSDB -> Time -2 days
 			From:      config.DayTime{Time: model.TimeFromUnix(testTime.Add(-48 * time.Hour).Unix())},
-			IndexType: config.TSDBType,
+			IndexType: types.TSDBType,
 		},
 	}
 
@@ -495,7 +587,7 @@ func Test_MaxQuerySize(t *testing.T) {
 	}{
 		{
 			desc:       "No TSDB",
-			schema:     config.BoltDBShipperType,
+			schema:     types.BoltDBShipperType,
 			query:      `{app="foo"} |= "foo"`,
 			queryRange: 1 * time.Hour,
 
@@ -667,7 +759,7 @@ func Test_MaxQuerySize_MaxLookBackPeriod(t *testing.T) {
 			}
 
 			handler := tc.middleware.Wrap(
-				base.HandlerFunc(func(_ context.Context, req base.Request) (base.Response, error) {
+				base.HandlerFunc(func(_ context.Context, _ base.Request) (base.Response, error) {
 					return &LokiResponse{}, nil
 				}),
 			)
@@ -680,14 +772,13 @@ func Test_MaxQuerySize_MaxLookBackPeriod(t *testing.T) {
 }
 
 func TestAcquireWithTiming(t *testing.T) {
-
 	ctx := context.Background()
 	sem := NewSemaphoreWithTiming(2)
 
 	// Channel to collect waiting times
 	waitingTimes := make(chan struct {
 		GoroutineID int
-		WaitingTime int64
+		WaitingTime time.Duration
 	}, 3)
 
 	tryAcquire := func(n int64, goroutineID int) {
@@ -697,8 +788,8 @@ func TestAcquireWithTiming(t *testing.T) {
 		}
 		waitingTimes <- struct {
 			GoroutineID int
-			WaitingTime int64
-		}{goroutineID, elapsed.Milliseconds()}
+			WaitingTime time.Duration
+		}{goroutineID, elapsed}
 
 		defer sem.sem.Release(n)
 
@@ -716,13 +807,13 @@ func TestAcquireWithTiming(t *testing.T) {
 	// Collect and sort waiting times
 	var waitingDurations []struct {
 		GoroutineID int
-		WaitingTime int64
+		WaitingTime time.Duration
 	}
 	for i := 0; i < 3; i++ {
 		waitingDurations = append(waitingDurations, <-waitingTimes)
 	}
 	// Find and check the waiting time for the third goroutine
-	var waiting3 int64
+	var waiting3 time.Duration
 	for _, waiting := range waitingDurations {
 		if waiting.GoroutineID == 3 {
 			waiting3 = waiting.WaitingTime
@@ -730,7 +821,7 @@ func TestAcquireWithTiming(t *testing.T) {
 		}
 	}
 
-	// Check that the waiting time for the third request is larger than 0 milliseconds and less than or equal to 10-5=5 milliseconds
-	require.Greater(t, waiting3, 0*time.Millisecond)
-	require.LessOrEqual(t, waiting3, 5*time.Millisecond)
+	// Check that the waiting time for the third request is larger than 0 milliseconds and less than 10 milliseconds
+	require.Greater(t, waiting3, 0*time.Nanosecond)
+	require.Less(t, waiting3, 10*time.Millisecond)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,31 +15,56 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grafana/dskit/backoff"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/chunkenc"
-	ingesterclient "github.com/grafana/loki/pkg/ingester/client"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql/log"
-	"github.com/grafana/loki/pkg/storage/chunk"
-	"github.com/grafana/loki/pkg/util/filter"
-	util_log "github.com/grafana/loki/pkg/util/log"
-	"github.com/grafana/loki/pkg/validation"
+	"github.com/grafana/loki/v3/pkg/chunkenc"
+	"github.com/grafana/loki/v3/pkg/compression"
+	ingesterclient "github.com/grafana/loki/v3/pkg/ingester/client"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/storage/chunk"
+	"github.com/grafana/loki/v3/pkg/util/filter"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/validation"
 )
 
 type mockChunkClient struct {
-	mtx           sync.Mutex
-	deletedChunks map[string]struct{}
+	mtx              sync.Mutex
+	deletedChunks    map[string]struct{}
+	unstableDeletion bool
+	perObjectCounter map[string]uint32
+}
+
+// newMockChunkClient creates a client that fails every first call to DeleteChunk if `unstableDeletion` is true.
+func newMockChunkClient(unstableDeletion bool) *mockChunkClient {
+	return &mockChunkClient{
+		deletedChunks:    map[string]struct{}{},
+		unstableDeletion: unstableDeletion,
+		perObjectCounter: map[string]uint32{},
+	}
+}
+
+// shouldFail returns true for every first call
+func (m *mockChunkClient) shouldFail(objectKey string) bool {
+	if !m.unstableDeletion {
+		return false
+	}
+	shouldFail := m.perObjectCounter[objectKey]%2 == 0
+	m.perObjectCounter[objectKey]++
+	return shouldFail
 }
 
 func (m *mockChunkClient) DeleteChunk(_ context.Context, _, chunkID string) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
-
+	if m.shouldFail(chunkID) {
+		return fmt.Errorf("chunk deletion for chunkID:%s is failed by mockChunkClient", chunkID)
+	}
 	m.deletedChunks[string([]byte(chunkID))] = struct{}{} // forces a copy, because this string is only valid within the delete fn.
 	return nil
 }
@@ -47,7 +73,7 @@ func (m *mockChunkClient) IsChunkNotFoundErr(_ error) bool {
 	return false
 }
 
-func (m *mockChunkClient) getDeletedChunkIds() []string {
+func (m *mockChunkClient) getDeletedChunkIDs() []string {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -128,7 +154,6 @@ func Test_Retention(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			// insert in the store.
 			var (
@@ -143,8 +168,9 @@ func Test_Retention(t *testing.T) {
 			// marks and sweep
 			expiration := NewExpirationChecker(tt.limits)
 			workDir := filepath.Join(t.TempDir(), "retention")
-			chunkClient := &mockChunkClient{deletedChunks: map[string]struct{}{}}
-			sweep, err := NewSweeper(workDir, chunkClient, 10, 0, nil)
+			// must not fail the process because deletion must be retried
+			chunkClient := newMockChunkClient(true)
+			sweep, err := NewSweeper(workDir, chunkClient, 10, 0, backoff.Config{MaxRetries: 2}, nil)
 			require.NoError(t, err)
 			sweep.Start()
 			defer sweep.Stop()
@@ -166,7 +192,7 @@ func Test_Retention(t *testing.T) {
 			store.Stop()
 			if len(expectDeleted) != 0 {
 				require.Eventually(t, func() bool {
-					actual := chunkClient.getDeletedChunkIds()
+					actual := chunkClient.getDeletedChunkIDs()
 					sort.Strings(actual)
 					return assert.ObjectsAreEqual(expectDeleted, actual)
 				}, 10*time.Second, 1*time.Second)
@@ -175,11 +201,48 @@ func Test_Retention(t *testing.T) {
 	}
 }
 
-type noopWriter struct{}
+func Test_Sweeper_deleteChunk(t *testing.T) {
+	chunkID := "1/3fff2c2d7595e046:1916fa8c4bd:1916fdfb33d:bd55fc5"
+	tests := map[string]struct {
+		maxRetries    int
+		expectedError error
+	}{
+		"expected error if chunk is not deleted and retry is disabled": {
+			maxRetries:    1,
+			expectedError: fmt.Errorf("chunk deletion for chunkID:%s is failed by mockChunkClient", chunkID),
+		},
+		"expected  no error if chunk is not deleted at the first attempt but retried": {
+			maxRetries: 2,
+		},
+	}
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			workDir := filepath.Join(t.TempDir(), "retention")
+			chunkClient := newMockChunkClient(true)
+			sweep, err := NewSweeper(workDir, chunkClient, 10, 0, backoff.Config{MaxRetries: data.maxRetries}, nil)
+			require.NoError(t, err)
 
-func (noopWriter) Put(_ []byte) error { return nil }
-func (noopWriter) Count() int64       { return 0 }
-func (noopWriter) Close() error       { return nil }
+			err = sweep.deleteChunk(context.Background(), []byte(chunkID))
+			if data.expectedError != nil {
+				require.Equal(t, data.expectedError, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+
+}
+
+type noopWriter struct {
+	count int64
+}
+
+func (n *noopWriter) Put(_ []byte) error {
+	n.count++
+	return nil
+}
+func (n *noopWriter) Count() int64 { return n.count }
+func (n *noopWriter) Close() error { return nil }
 
 func Test_EmptyTable(t *testing.T) {
 	schema := allSchemas[0]
@@ -197,11 +260,11 @@ func Test_EmptyTable(t *testing.T) {
 	tables := store.indexTables()
 	require.Len(t, tables, 1)
 	// Set a very low retention to make sure all chunks are marked for deletion which will create an empty table.
-	empty, _, err := markForDelete(context.Background(), 0, tables[0].name, noopWriter{}, tables[0], NewExpirationChecker(&fakeLimits{perTenant: map[string]retentionLimit{"1": {retentionPeriod: time.Second}, "2": {retentionPeriod: time.Second}}}), nil, util_log.Logger)
+	empty, _, err := markForDelete(context.Background(), 0, tables[0].name, &noopWriter{}, tables[0], NewExpirationChecker(&fakeLimits{perTenant: map[string]retentionLimit{"1": {retentionPeriod: time.Second}, "2": {retentionPeriod: time.Second}}}), nil, util_log.Logger)
 	require.NoError(t, err)
 	require.True(t, empty)
 
-	_, _, err = markForDelete(context.Background(), 0, tables[0].name, noopWriter{}, newTable("test"), NewExpirationChecker(&fakeLimits{}), nil, util_log.Logger)
+	_, _, err = markForDelete(context.Background(), 0, tables[0].name, &noopWriter{}, newTable("test"), NewExpirationChecker(&fakeLimits{}), nil, util_log.Logger)
 	require.Equal(t, err, errNoChunksFound)
 }
 
@@ -215,14 +278,16 @@ func createChunk(t testing.TB, userID string, lbs labels.Labels, from model.Time
 	labelsBuilder.Set(labels.MetricName, "logs")
 	metric := labelsBuilder.Labels()
 	fp := ingesterclient.Fingerprint(lbs)
-	chunkEnc := chunkenc.NewMemChunk(chunkenc.ChunkFormatV4, chunkenc.EncSnappy, chunkenc.UnorderedWithStructuredMetadataHeadBlockFmt, blockSize, targetSize)
+	chunkEnc := chunkenc.NewMemChunk(chunkenc.ChunkFormatV4, compression.Snappy, chunkenc.UnorderedWithStructuredMetadataHeadBlockFmt, blockSize, targetSize)
 
 	for ts := from; !ts.After(through); ts = ts.Add(1 * time.Minute) {
-		require.NoError(t, chunkEnc.Append(&logproto.Entry{
+		dup, err := chunkEnc.Append(&logproto.Entry{
 			Timestamp:          ts.Time(),
 			Line:               ts.String(),
 			StructuredMetadata: logproto.FromLabelsToLabelAdapters(labels.FromStrings("foo", ts.String())),
-		}))
+		})
+		require.False(t, dup)
+		require.NoError(t, err)
 	}
 
 	require.NoError(t, chunkEnc.Close())
@@ -294,7 +359,7 @@ func TestChunkRewriter(t *testing.T) {
 		{
 			name:  "no rewrites",
 			chunk: createChunk(t, "1", labels.Labels{labels.Label{Name: "foo", Value: "bar"}}, todaysTableInterval.Start, todaysTableInterval.Start.Add(time.Hour)),
-			filterFunc: func(ts time.Time, s string, _ ...labels.Label) bool {
+			filterFunc: func(_ time.Time, _ string, _ ...labels.Label) bool {
 				return false
 			},
 			expectedRespByTables: map[string]tableResp{
@@ -304,7 +369,7 @@ func TestChunkRewriter(t *testing.T) {
 		{
 			name:  "no rewrites with chunk spanning multiple tables",
 			chunk: createChunk(t, "1", labels.Labels{labels.Label{Name: "foo", Value: "bar"}}, todaysTableInterval.End.Add(-48*time.Hour), todaysTableInterval.End),
-			filterFunc: func(ts time.Time, s string, _ ...labels.Label) bool {
+			filterFunc: func(_ time.Time, _ string, _ ...labels.Label) bool {
 				return false
 			},
 			expectedRespByTables: map[string]tableResp{
@@ -500,7 +565,6 @@ func TestChunkRewriter(t *testing.T) {
 			},
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			store := newTestStore(t)
 			require.NoError(t, store.Put(context.TODO(), []chunk.Chunk{tt.chunk}))
@@ -555,7 +619,7 @@ func TestChunkRewriter(t *testing.T) {
 							Timestamp:          curr.Time(),
 							Line:               curr.String(),
 							StructuredMetadata: logproto.FromLabelsToLabelAdapters(expectedStructuredMetadata),
-						}, newChunkItr.Entry())
+						}, newChunkItr.At())
 						require.Equal(t, expectedStructuredMetadata.String(), newChunkItr.Labels())
 					}
 				}
@@ -632,6 +696,7 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 		expectedDeletedSeries []map[uint64]struct{}
 		expectedEmpty         []bool
 		expectedModified      []bool
+		numChunksDeleted      []int64
 	}{
 		{
 			name: "no chunk and series deleted",
@@ -652,6 +717,9 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			expectedModified: []bool{
 				false,
 			},
+			numChunksDeleted: []int64{
+				0,
+			},
 		},
 		{
 			name: "chunk deleted with filter but no lines matching",
@@ -661,7 +729,7 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			expiry: []chunkExpiry{
 				{
 					isExpired: true,
-					filterFunc: func(ts time.Time, s string, _ ...labels.Label) bool {
+					filterFunc: func(_ time.Time, _ string, _ ...labels.Label) bool {
 						return false
 					},
 				},
@@ -674,6 +742,9 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			},
 			expectedModified: []bool{
 				false,
+			},
+			numChunksDeleted: []int64{
+				0,
 			},
 		},
 		{
@@ -694,6 +765,9 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			},
 			expectedModified: []bool{
 				true,
+			},
+			numChunksDeleted: []int64{
+				1,
 			},
 		},
 		{
@@ -723,6 +797,9 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			expectedModified: []bool{
 				true,
 			},
+			numChunksDeleted: []int64{
+				1,
+			},
 		},
 		{
 			name: "one of two chunks deleted",
@@ -746,6 +823,9 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			},
 			expectedModified: []bool{
 				true,
+			},
+			numChunksDeleted: []int64{
+				1,
 			},
 		},
 		{
@@ -779,6 +859,9 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			expectedModified: []bool{
 				true,
 			},
+			numChunksDeleted: []int64{
+				1,
+			},
 		},
 		{
 			name: "one big chunk partially deleted for yesterdays table without rewrite",
@@ -788,7 +871,7 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			expiry: []chunkExpiry{
 				{
 					isExpired: true,
-					filterFunc: func(ts time.Time, s string, _ ...labels.Label) bool {
+					filterFunc: func(ts time.Time, _ string, _ ...labels.Label) bool {
 						return ts.UnixNano() < todaysTableInterval.Start.UnixNano()
 					},
 				},
@@ -802,6 +885,9 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			expectedModified: []bool{
 				true, true,
 			},
+			numChunksDeleted: []int64{
+				1, 0,
+			},
 		},
 		{
 			name: "one big chunk partially deleted for yesterdays table with rewrite",
@@ -811,7 +897,7 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			expiry: []chunkExpiry{
 				{
 					isExpired: true,
-					filterFunc: func(ts time.Time, s string, _ ...labels.Label) bool {
+					filterFunc: func(ts time.Time, _ string, _ ...labels.Label) bool {
 						return ts.UnixNano() < todaysTableInterval.Start.Add(-30*time.Minute).UnixNano()
 					},
 				},
@@ -824,6 +910,9 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 			},
 			expectedModified: []bool{
 				true, true,
+			},
+			numChunksDeleted: []int64{
+				1, 0,
 			},
 		},
 	} {
@@ -847,10 +936,12 @@ func TestMarkForDelete_SeriesCleanup(t *testing.T) {
 				seriesCleanRecorder := newSeriesCleanRecorder(table)
 
 				cr := newChunkRewriter(store.chunkClient, table.name, table)
-				empty, isModified, err := markForDelete(context.Background(), 0, table.name, noopWriter{}, seriesCleanRecorder, expirationChecker, cr, util_log.Logger)
+				marker := &noopWriter{}
+				empty, isModified, err := markForDelete(context.Background(), 0, table.name, marker, seriesCleanRecorder, expirationChecker, cr, util_log.Logger)
 				require.NoError(t, err)
 				require.Equal(t, tc.expectedEmpty[i], empty)
 				require.Equal(t, tc.expectedModified[i], isModified)
+				require.Equal(t, tc.numChunksDeleted[i], marker.count)
 
 				require.EqualValues(t, tc.expectedDeletedSeries[i], seriesCleanRecorder.deletedSeries[userID])
 			}
@@ -884,7 +975,7 @@ func TestDeleteTimeout(t *testing.T) {
 			context.Background(),
 			tc.timeout,
 			table.name,
-			noopWriter{},
+			&noopWriter{},
 			newSeriesCleanRecorder(table),
 			expirationChecker,
 			newChunkRewriter(store.chunkClient, table.name, table),
@@ -925,7 +1016,7 @@ func TestMarkForDelete_DropChunkFromIndex(t *testing.T) {
 	require.Len(t, tables, 8)
 
 	for i, table := range tables {
-		empty, _, err := markForDelete(context.Background(), 0, table.name, noopWriter{}, table,
+		empty, _, err := markForDelete(context.Background(), 0, table.name, &noopWriter{}, table,
 			NewExpirationChecker(fakeLimits{perTenant: map[string]retentionLimit{"1": {retentionPeriod: retentionPeriod}}}), nil, util_log.Logger)
 		require.NoError(t, err)
 		if i == 7 {

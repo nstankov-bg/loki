@@ -12,12 +12,12 @@ import (
 	"github.com/grafana/dskit/tenant"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/querier/queryrange/queryrangebase"
-	"github.com/grafana/loki/pkg/storage/chunk/cache"
-	"github.com/grafana/loki/pkg/storage/chunk/cache/resultscache"
-	"github.com/grafana/loki/pkg/util"
-	"github.com/grafana/loki/pkg/util/validation"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache/resultscache"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/validation"
 )
 
 type VolumeSplitter struct {
@@ -101,6 +101,7 @@ func NewVolumeCacheMiddleware(
 	merger queryrangebase.Merger,
 	c cache.Cache,
 	cacheGenNumberLoader queryrangebase.CacheGenNumberLoader,
+	iqo util.IngesterQueryOptions,
 	shouldCache queryrangebase.ShouldCacheFn,
 	parallelismForReq queryrangebase.ParallelismForReqFn,
 	retentionEnabled bool,
@@ -110,7 +111,7 @@ func NewVolumeCacheMiddleware(
 	return queryrangebase.NewResultsCacheMiddleware(
 		log,
 		c,
-		VolumeSplitter{cacheKeyLimits{limits, transformer}},
+		VolumeSplitter{cacheKeyLimits{limits, transformer, iqo}},
 		limits,
 		merger,
 		VolumeExtractor{},
@@ -130,6 +131,7 @@ func NewVolumeCacheMiddleware(
 		},
 		parallelismForReq,
 		retentionEnabled,
+		false,
 		metrics,
 	)
 }

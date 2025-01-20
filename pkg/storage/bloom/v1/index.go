@@ -3,97 +3,26 @@ package v1
 import (
 	"bytes"
 	"io"
+	"sort"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/pkg/chunkenc"
-	"github.com/grafana/loki/pkg/util/encoding"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/util/encoding"
 )
-
-type Schema struct {
-	version                byte
-	encoding               chunkenc.Encoding
-	nGramLength, nGramSkip uint64
-}
-
-// byte length
-func (s Schema) Len() int {
-	// magic number + version + encoding + ngram length + ngram skip
-	return 4 + 1 + 1 + 8 + 8
-}
-
-func (s *Schema) DecompressorPool() chunkenc.ReaderPool {
-	return chunkenc.GetReaderPool(s.encoding)
-}
-
-func (s *Schema) CompressorPool() chunkenc.WriterPool {
-	return chunkenc.GetWriterPool(s.encoding)
-}
-
-func (s *Schema) Encode(enc *encoding.Encbuf) {
-	enc.Reset()
-	enc.PutBE32(magicNumber)
-	enc.PutByte(s.version)
-	enc.PutByte(byte(s.encoding))
-	enc.PutBE64(s.nGramLength)
-	enc.PutBE64(s.nGramSkip)
-
-}
-
-func (s *Schema) DecodeFrom(r io.ReadSeeker) error {
-	// TODO(owen-d): improve allocations
-	schemaBytes := make([]byte, s.Len())
-	_, err := io.ReadFull(r, schemaBytes)
-	if err != nil {
-		return errors.Wrap(err, "reading schema")
-	}
-
-	dec := encoding.DecWith(schemaBytes)
-	return s.Decode(&dec)
-}
-
-func (s *Schema) Decode(dec *encoding.Decbuf) error {
-	number := dec.Be32()
-	if number != magicNumber {
-		return errors.Errorf("invalid magic number. expected %x, got  %x", magicNumber, number)
-	}
-	s.version = dec.Byte()
-	if s.version != 1 {
-		return errors.Errorf("invalid version. expected %d, got %d", 1, s.version)
-	}
-
-	s.encoding = chunkenc.Encoding(dec.Byte())
-	if _, err := chunkenc.ParseEncoding(s.encoding.String()); err != nil {
-		return errors.Wrap(err, "parsing encoding")
-	}
-
-	s.nGramLength = dec.Be64()
-	s.nGramSkip = dec.Be64()
-
-	return dec.Err()
-}
-
-func (s Schema) NGramLen() int {
-	return int(s.nGramLength)
-}
 
 // Block index is a set of series pages along with
 // the headers for each page
 type BlockIndex struct {
-	schema      Schema
+	opts BlockOptions
+
 	pageHeaders []SeriesPageHeaderWithOffset // headers for each series page
 }
 
-func NewBlockIndex(encoding chunkenc.Encoding) BlockIndex {
-	return BlockIndex{
-		schema: Schema{version: DefaultSchemaVersion, encoding: encoding},
-	}
-}
-
-func (b *BlockIndex) DecodeHeaders(r io.ReadSeeker) error {
-	if err := b.schema.DecodeFrom(r); err != nil {
-		return errors.Wrap(err, "decoding schema")
+func (b *BlockIndex) DecodeHeaders(r io.ReadSeeker) (uint32, error) {
+	if err := b.opts.DecodeFrom(r); err != nil {
+		return 0, errors.Wrap(err, "decoding block options")
 	}
 
 	var (
@@ -103,24 +32,25 @@ func (b *BlockIndex) DecodeHeaders(r io.ReadSeeker) error {
 
 	// last 12 bytes are (headers offset: 8 byte u64, checksum: 4 byte u32)
 	if _, err := r.Seek(-12, io.SeekEnd); err != nil {
-		return errors.Wrap(err, "seeking to bloom headers metadata")
+		return 0, errors.Wrap(err, "seeking to bloom headers metadata")
 	}
 	dec.B, err = io.ReadAll(r)
 	if err != nil {
-		return errors.Wrap(err, "reading bloom headers metadata")
+		return 0, errors.Wrap(err, "reading bloom headers metadata")
 	}
 
 	headerOffset := dec.Be64()
+	checksum := dec.Be32()
 	if _, err := r.Seek(int64(headerOffset), io.SeekStart); err != nil {
-		return errors.Wrap(err, "seeking to index headers")
+		return 0, errors.Wrap(err, "seeking to index headers")
 	}
 	dec.B, err = io.ReadAll(r)
 	if err != nil {
-		return errors.Wrap(err, "reading index page headers")
+		return 0, errors.Wrap(err, "reading index page headers")
 	}
 
 	if err := dec.CheckCrc(castagnoliTable); err != nil {
-		return errors.Wrap(err, "checksumming page headers")
+		return 0, errors.Wrap(err, "checksumming page headers")
 	}
 
 	b.pageHeaders = make(
@@ -131,24 +61,33 @@ func (b *BlockIndex) DecodeHeaders(r io.ReadSeeker) error {
 	for i := 0; i < len(b.pageHeaders); i++ {
 		var s SeriesPageHeaderWithOffset
 		if err := s.Decode(&dec); err != nil {
-			return errors.Wrapf(err, "decoding %dth series header", i)
+			return 0, errors.Wrapf(err, "decoding %dth series header", i)
 		}
 		b.pageHeaders[i] = s
 	}
 
-	return nil
+	return checksum, nil
 }
 
 // decompress page and return an iterator over the bytes
-func (b *BlockIndex) NewSeriesPageDecoder(r io.ReadSeeker, header SeriesPageHeaderWithOffset) (*SeriesPageDecoder, error) {
+func (b *BlockIndex) NewSeriesPageDecoder(r io.ReadSeeker, header SeriesPageHeaderWithOffset, metrics *Metrics) (res *SeriesPageDecoder, err error) {
+	defer func() {
+		if err != nil {
+			metrics.pagesSkipped.WithLabelValues(pageTypeSeries, skipReasonErr).Inc()
+			metrics.bytesSkipped.WithLabelValues(pageTypeSeries, skipReasonErr).Add(float64(header.DecompressedLen))
+		} else {
+			metrics.pagesRead.WithLabelValues(pageTypeSeries).Inc()
+			metrics.bytesRead.WithLabelValues(pageTypeSeries).Add(float64(header.DecompressedLen))
+		}
+	}()
 
 	if _, err := r.Seek(int64(header.Offset), io.SeekStart); err != nil {
 		return nil, errors.Wrap(err, "seeking to series page")
 	}
 
-	data := BlockPool.Get(header.Len)[:header.Len]
-	defer BlockPool.Put(data)
-	_, err := io.ReadFull(r, data)
+	data, _ := SeriesPagePool.Get(header.Len)
+	defer SeriesPagePool.Put(data)
+	_, err = io.ReadFull(r, data)
 	if err != nil {
 		return nil, errors.Wrap(err, "reading series page")
 	}
@@ -159,24 +98,20 @@ func (b *BlockIndex) NewSeriesPageDecoder(r io.ReadSeeker, header SeriesPageHead
 		return nil, errors.Wrap(err, "checksumming series page")
 	}
 
-	decompressor, err := b.schema.DecompressorPool().GetReader(bytes.NewReader(dec.Get()))
+	decompressor, err := b.opts.Schema.DecompressorPool().GetReader(bytes.NewReader(dec.Get()))
 	if err != nil {
 		return nil, errors.Wrap(err, "getting decompressor")
 	}
 
-	decompressed := BlockPool.Get(header.DecompressedLen)[:header.DecompressedLen]
+	decompressed := make([]byte, header.DecompressedLen)
 	if _, err = io.ReadFull(decompressor, decompressed); err != nil {
 		return nil, errors.Wrap(err, "decompressing series page")
 	}
 
-	// replace decoder's input with the now-decompressed data
-	dec.B = decompressed
-
-	res := &SeriesPageDecoder{
+	res = &SeriesPageDecoder{
+		schema: b.opts.Schema,
 		data:   decompressed,
 		header: header.SeriesHeader,
-
-		i: -1,
 	}
 
 	res.Reset()
@@ -205,12 +140,8 @@ func (h *SeriesPageHeaderWithOffset) Decode(dec *encoding.Decbuf) error {
 
 type SeriesHeader struct {
 	NumSeries         int
-	FromFp, ThroughFp model.Fingerprint
+	Bounds            FingerprintBounds
 	FromTs, ThroughTs model.Time
-}
-
-func (h SeriesHeader) OverlapFingerprintRange(other SeriesHeader) bool {
-	return h.ThroughFp >= other.FromFp && h.FromFp <= other.ThroughFp
 }
 
 // build one aggregated header for the entire block
@@ -219,13 +150,15 @@ func aggregateHeaders(xs []SeriesHeader) SeriesHeader {
 		return SeriesHeader{}
 	}
 
+	fromFp, _ := xs[0].Bounds.Bounds()
+	_, throughFP := xs[len(xs)-1].Bounds.Bounds()
 	res := SeriesHeader{
-		FromFp:    xs[0].FromFp,
-		ThroughFp: xs[len(xs)-1].ThroughFp,
+		NumSeries: len(xs),
+		Bounds:    NewBounds(fromFp, throughFP),
 	}
 
-	for _, x := range xs {
-		if x.FromTs < res.FromTs {
+	for i, x := range xs {
+		if i == 0 || x.FromTs < res.FromTs {
 			res.FromTs = x.FromTs
 		}
 		if x.ThroughTs > res.ThroughTs {
@@ -237,16 +170,16 @@ func aggregateHeaders(xs []SeriesHeader) SeriesHeader {
 
 func (h *SeriesHeader) Encode(enc *encoding.Encbuf) {
 	enc.PutUvarint(h.NumSeries)
-	enc.PutUvarint64(uint64(h.FromFp))
-	enc.PutUvarint64(uint64(h.ThroughFp))
+	enc.PutUvarint64(uint64(h.Bounds.Min))
+	enc.PutUvarint64(uint64(h.Bounds.Max))
 	enc.PutVarint64(int64(h.FromTs))
 	enc.PutVarint64(int64(h.ThroughTs))
 }
 
 func (h *SeriesHeader) Decode(dec *encoding.Decbuf) error {
 	h.NumSeries = dec.Uvarint()
-	h.FromFp = model.Fingerprint(dec.Uvarint64())
-	h.ThroughFp = model.Fingerprint(dec.Uvarint64())
+	h.Bounds.Min = model.Fingerprint(dec.Uvarint64())
+	h.Bounds.Max = model.Fingerprint(dec.Uvarint64())
 	h.FromTs = model.Time(dec.Varint64())
 	h.ThroughTs = model.Time(dec.Varint64())
 	return dec.Err()
@@ -255,13 +188,14 @@ func (h *SeriesHeader) Decode(dec *encoding.Decbuf) error {
 // can decode a series page one item at a time, useful when we don't
 // need to iterate an entire page
 type SeriesPageDecoder struct {
+	schema Schema
 	data   []byte
 	dec    encoding.Decbuf
 	header SeriesHeader
 
 	// state
 	i              int // current index
-	cur            *SeriesWithOffset
+	cur            *SeriesWithMeta
 	err            error
 	previousFp     model.Fingerprint // previous series' fingerprint for delta-decoding
 	previousOffset BloomOffset       // previous series' bloom offset for delta-decoding
@@ -286,8 +220,8 @@ func (d *SeriesPageDecoder) Next() bool {
 		return false
 	}
 
-	var res SeriesWithOffset
-	d.previousFp, d.previousOffset, d.err = res.Decode(&d.dec, d.previousFp, d.previousOffset)
+	var res SeriesWithMeta
+	d.previousFp, d.previousOffset, d.err = res.Decode(&d.dec, d.schema.version, d.previousFp, d.previousOffset)
 	if d.err != nil {
 		return false
 	}
@@ -297,8 +231,9 @@ func (d *SeriesPageDecoder) Next() bool {
 }
 
 func (d *SeriesPageDecoder) Seek(fp model.Fingerprint) {
-	if fp > d.header.ThroughFp || fp < d.header.FromFp {
-		// shortcut: we know the fingerprint is not in this page
+	if fp > d.header.Bounds.Max {
+		// shortcut: we know the fingerprint is too large so nothing in this page
+		// will match the seek call, which returns the first found fingerprint >= fp.
 		// so masquerade the index as if we've already iterated through
 		d.i = d.header.NumSeries
 	}
@@ -335,7 +270,7 @@ func (d *SeriesPageDecoder) Seek(fp model.Fingerprint) {
 	}
 }
 
-func (d *SeriesPageDecoder) At() (res *SeriesWithOffset) {
+func (d *SeriesPageDecoder) At() (res *SeriesWithMeta) {
 	return d.cur
 }
 
@@ -346,87 +281,163 @@ func (d *SeriesPageDecoder) Err() error {
 	return d.dec.Err()
 }
 
+// series encoding/decoding --------------------------------------------------
+
 type Series struct {
 	Fingerprint model.Fingerprint
 	Chunks      ChunkRefs
 }
 
-type SeriesWithOffset struct {
-	Offset BloomOffset
-	Series
+type Meta struct {
+	Fields  Set[Field]
+	Offsets []BloomOffset
 }
 
-func (s *SeriesWithOffset) Encode(
+type SeriesWithMeta struct {
+	Series
+	Meta
+}
+
+func (s *SeriesWithMeta) Encode(
 	enc *encoding.Encbuf,
+	version Version,
 	previousFp model.Fingerprint,
 	previousOffset BloomOffset,
-) (model.Fingerprint, BloomOffset) {
+) BloomOffset {
 	// delta encode fingerprint
-	enc.PutBE64(uint64(s.Fingerprint - previousFp))
-	// delta encode offsets
-	s.Offset.Encode(enc, previousOffset)
+	enc.PutUvarint64(uint64(s.Fingerprint - previousFp))
+	// encode number of bloom offsets in this series
+	enc.PutUvarint(len(s.Offsets))
+
+	lastOffset := previousOffset
+	for _, offset := range s.Offsets {
+		// delta encode offsets.
+		offset.Encode(enc, version, lastOffset)
+		lastOffset = offset
+	}
 
 	// encode chunks using delta encoded timestamps
 	var lastEnd model.Time
 	enc.PutUvarint(len(s.Chunks))
+	sort.Sort(s.Chunks) // ensure order
 	for _, chunk := range s.Chunks {
-		lastEnd = chunk.Encode(enc, lastEnd)
+		lastEnd = chunk.Encode(enc, version, lastEnd)
 	}
 
-	return s.Fingerprint, s.Offset
+	enc.PutUvarint(s.Fields.Len())
+	for _, f := range s.Fields.Items() {
+		f.Encode(enc, version)
+	}
+
+	return lastOffset
 }
 
-func (s *SeriesWithOffset) Decode(dec *encoding.Decbuf, previousFp model.Fingerprint, previousOffset BloomOffset) (model.Fingerprint, BloomOffset, error) {
-	s.Fingerprint = previousFp + model.Fingerprint(dec.Be64())
-	if err := s.Offset.Decode(dec, previousOffset); err != nil {
-		return 0, BloomOffset{}, errors.Wrap(err, "decoding bloom offset")
+func (s *SeriesWithMeta) Decode(
+	dec *encoding.Decbuf,
+	version Version,
+	previousFp model.Fingerprint,
+	previousOffset BloomOffset,
+) (model.Fingerprint, BloomOffset, error) {
+	if version < V3 {
+		return 0, BloomOffset{}, ErrUnsupportedSchemaVersion
 	}
 
-	// TODO(owen-d): use pool
-	s.Chunks = make([]ChunkRef, dec.Uvarint())
+	s.Fingerprint = previousFp + model.Fingerprint(dec.Uvarint64())
+	numOffsets := dec.Uvarint()
+
 	var (
-		err     error
-		lastEnd model.Time
+		err        error
+		lastEnd    model.Time
+		lastOffset = previousOffset
 	)
+
+	s.Offsets = make([]BloomOffset, numOffsets)
+	for i := range s.Offsets {
+		// SeriesWithOffsets is a v2+ feature with multiple bloom offsets per series
+		// so we signal that to the decoder
+		err = s.Offsets[i].Decode(dec, version, lastOffset)
+		lastOffset = s.Offsets[i]
+		if err != nil {
+			return 0, BloomOffset{}, errors.Wrapf(err, "decoding %dth bloom offset", i)
+		}
+	}
+
+	s.Chunks = make([]ChunkRef, dec.Uvarint())
 	for i := range s.Chunks {
-		lastEnd, err = s.Chunks[i].Decode(dec, lastEnd)
+		lastEnd, err = s.Chunks[i].Decode(dec, version, lastEnd)
 		if err != nil {
 			return 0, BloomOffset{}, errors.Wrapf(err, "decoding %dth chunk", i)
 		}
 	}
-	return s.Fingerprint, s.Offset, dec.Err()
-}
 
-type ChunkRef struct {
-	Start, End model.Time
-	Checksum   uint32
-}
-
-func (r *ChunkRef) Less(other ChunkRef) bool {
-	if r.Start != other.Start {
-		return r.Start < other.Start
+	n := dec.Uvarint()
+	s.Fields = NewSet[Field](n)
+	for i := 0; i < n; i++ {
+		var f Field
+		err = f.Decode(dec, version)
+		if err != nil {
+			return 0, BloomOffset{}, errors.Wrapf(err, "decoding %dth field", i)
+		}
+		s.Fields.Add(f)
 	}
 
-	if r.End != other.End {
-		return r.End < other.End
+	return s.Fingerprint, lastOffset, dec.Err()
+}
+
+// field encoding/decoding ---------------------------------------------------
+
+type Field string
+
+func (f Field) Encode(enc *encoding.Encbuf, _ Version) {
+	enc.PutUvarintBytes([]byte(f))
+}
+
+func (f *Field) Decode(dec *encoding.Decbuf, _ Version) error {
+	*f = Field(dec.UvarintBytes())
+	return dec.Err()
+}
+
+// chunk encoding/decoding ---------------------------------------------------
+
+type ChunkRef logproto.ShortRef
+
+func (r *ChunkRef) Less(other ChunkRef) bool {
+	if r.From != other.From {
+		return r.From < other.From
+	}
+
+	if r.Through != other.Through {
+		return r.Through < other.Through
 	}
 
 	return r.Checksum < other.Checksum
 }
 
-func (r *ChunkRef) Encode(enc *encoding.Encbuf, previousEnd model.Time) model.Time {
-	// delta encode start time
-	enc.PutVarint64(int64(r.Start - previousEnd))
-	enc.PutVarint64(int64(r.End - r.Start))
-	enc.PutBE32(r.Checksum)
-	return r.End
+func (r *ChunkRef) Cmp(other ChunkRef) int {
+	if r.From != other.From {
+		return int(r.From) - int(other.From)
+	}
+
+	if r.Through != other.Through {
+		return int(r.Through) - int(other.Through)
+	}
+
+	return int(r.Checksum) - int(other.Checksum)
 }
 
-func (r *ChunkRef) Decode(dec *encoding.Decbuf, previousEnd model.Time) (model.Time, error) {
-	r.Start = previousEnd + model.Time(dec.Varint64())
-	r.End = r.Start + model.Time(dec.Varint64())
+func (r *ChunkRef) Encode(enc *encoding.Encbuf, _ Version, previousEnd model.Time) model.Time {
+	// delta encode start time
+	enc.PutVarint64(int64(r.From - previousEnd))
+	enc.PutVarint64(int64(r.Through - r.From))
+	enc.PutBE32(r.Checksum)
+	return r.Through
+}
+
+func (r *ChunkRef) Decode(dec *encoding.Decbuf, _ Version, previousEnd model.Time) (model.Time, error) {
+	r.From = previousEnd + model.Time(dec.Varint64())
+	r.Through = r.From + model.Time(dec.Varint64())
 	r.Checksum = dec.Be32()
-	return r.End, dec.Err()
+	return r.Through, dec.Err()
 }
 
 type BloomOffset struct {
@@ -434,14 +445,15 @@ type BloomOffset struct {
 	ByteOffset int // offset to beginning of bloom within page
 }
 
-func (o *BloomOffset) Encode(enc *encoding.Encbuf, previousOffset BloomOffset) {
+func (o *BloomOffset) Encode(enc *encoding.Encbuf, _ Version, previousOffset BloomOffset) {
+	// page offsets diffs are always ascending
 	enc.PutUvarint(o.Page - previousOffset.Page)
-	enc.PutUvarint(o.ByteOffset - previousOffset.ByteOffset)
+	enc.PutVarint64(int64(o.ByteOffset - previousOffset.ByteOffset))
 }
 
-func (o *BloomOffset) Decode(dec *encoding.Decbuf, previousOffset BloomOffset) error {
+func (o *BloomOffset) Decode(dec *encoding.Decbuf, _ Version, previousOffset BloomOffset) error {
 	o.Page = previousOffset.Page + dec.Uvarint()
-	o.ByteOffset = previousOffset.ByteOffset + dec.Uvarint()
+	o.ByteOffset = previousOffset.ByteOffset + int(dec.Varint64())
 	return dec.Err()
 }
 
@@ -498,4 +510,39 @@ func (refs ChunkRefs) Compare(others ChunkRefs, populateInclusive bool) (exclusi
 	}
 
 	return
+}
+
+func (refs ChunkRefs) Intersect(others ChunkRefs) ChunkRefs {
+	_, res := refs.Compare(others, true)
+	return res
+}
+
+func (refs ChunkRefs) Union(others ChunkRefs) ChunkRefs {
+	var res ChunkRefs
+	var i, j int
+	for i < len(refs) && j < len(others) {
+		switch {
+		case refs[i] == others[j]:
+			res = append(res, refs[i])
+			i++
+			j++
+		case refs[i].Less(others[j]):
+			res = append(res, refs[i])
+			i++
+		default:
+			res = append(res, others[j])
+			j++
+		}
+	}
+
+	// append any remaining refs
+	if i < len(refs) {
+		res = append(res, refs[i:]...)
+	}
+
+	if j < len(others) {
+		res = append(res, others[j:]...)
+	}
+
+	return res
 }

@@ -3,11 +3,11 @@ package manifests
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// BuildRulerServiceAccount returns a k8s object for the LokiStack
+// BuildServiceAccount returns a k8s object for the LokiStack
 // serviceaccount.
 func BuildServiceAccount(opts Options) client.Object {
 	return &corev1.ServiceAccount{
@@ -20,6 +20,6 @@ func BuildServiceAccount(opts Options) client.Object {
 			Namespace: opts.Namespace,
 			Labels:    commonLabels(opts.Name),
 		},
-		AutomountServiceAccountToken: pointer.Bool(true),
+		AutomountServiceAccountToken: ptr.To(true),
 	}
 }

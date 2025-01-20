@@ -11,13 +11,13 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logqlmodel/stats"
-	"github.com/grafana/loki/pkg/querier/queryrange/queryrangebase"
-	"github.com/grafana/loki/pkg/storage/chunk/cache"
-	"github.com/grafana/loki/pkg/storage/chunk/cache/resultscache"
-	"github.com/grafana/loki/pkg/util"
-	"github.com/grafana/loki/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache/resultscache"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/constants"
 )
 
 func TestIndexStatsCache(t *testing.T) {
@@ -35,6 +35,7 @@ func TestIndexStatsCache(t *testing.T) {
 		WithSplitByLimits(fakeLimits{}, 24*time.Hour),
 		DefaultCodec,
 		c,
+		nil,
 		nil,
 		nil,
 		func(_ context.Context, _ []string, _ queryrangebase.Request) int {
@@ -180,6 +181,7 @@ func TestIndexStatsCache_RecentData(t *testing.T) {
 				c,
 				nil,
 				nil,
+				nil,
 				func(_ context.Context, _ []string, _ queryrangebase.Request) int {
 					return 1
 				},
@@ -210,7 +212,7 @@ func TestIndexStatsCache_RecentData(t *testing.T) {
 
 func indexStatsResultHandler(v *IndexStatsResponse) (*int, queryrangebase.Handler) {
 	calls := 0
-	return &calls, queryrangebase.HandlerFunc(func(_ context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
+	return &calls, queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
 		calls++
 		return v, nil
 	})

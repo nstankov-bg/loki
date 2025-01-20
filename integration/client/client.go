@@ -14,18 +14,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/buger/jsonparser"
 	"github.com/gorilla/websocket"
 	"github.com/grafana/dskit/user"
+	"github.com/grafana/jsonparser"
 	"github.com/prometheus/common/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 
-	logcli "github.com/grafana/loki/pkg/logcli/client"
-	"github.com/grafana/loki/pkg/loghttp"
-	"github.com/grafana/loki/pkg/util/unmarshal"
+	logcli "github.com/grafana/loki/v3/pkg/logcli/client"
+	"github.com/grafana/loki/v3/pkg/loghttp"
+	"github.com/grafana/loki/v3/pkg/util/unmarshal"
 )
 
 const requestTimeout = 30 * time.Second
@@ -111,7 +111,7 @@ func (c *Client) PushOTLPLogLine(line string, timestamp time.Time, logAttributes
 	return c.pushOTLPLogLine(line, timestamp, logAttributes)
 }
 
-func formatTS(ts time.Time) string {
+func FormatTS(ts time.Time) string {
 	return strconv.FormatInt(ts.UnixNano(), 10)
 }
 
@@ -130,7 +130,7 @@ func (c *Client) pushLogLine(line string, timestamp time.Time, structuredMetadat
 		},
 		Values: [][]any{
 			{
-				formatTS(timestamp),
+				FormatTS(timestamp),
 				line,
 				structuredMetadata,
 			},
@@ -177,7 +177,7 @@ func (c *Client) pushLogLine(line string, timestamp time.Time, structuredMetadat
 	return fmt.Errorf("request failed with status code %v: %s", res.StatusCode, buf)
 }
 
-// pushLogLine creates a new logline
+// pushOTLPLogLine creates a new logline
 func (c *Client) pushOTLPLogLine(line string, timestamp time.Time, logAttributes map[string]any) error {
 	apiEndpoint := fmt.Sprintf("%s/otlp/v1/logs", c.baseURL)
 
@@ -237,10 +237,11 @@ func (c *Client) Get(path string) (*http.Response, error) {
 // Get all the metrics
 func (c *Client) Metrics() (string, error) {
 	url := fmt.Sprintf("%s/metrics", c.baseURL)
-	res, err := http.Get(url)
+	res, err := http.Get(url) //#nosec G107 -- Intentionally taking user input from config
 	if err != nil {
 		return "", err
 	}
+	defer res.Body.Close()
 
 	var sb strings.Builder
 	if _, err := io.Copy(&sb, res.Body); err != nil {
@@ -479,12 +480,21 @@ type Header struct {
 	Name, Value string
 }
 
-// RunRangeQuery runs a query and returns an error if anything went wrong
+// RunRangeQuery runs a 7d query and returns an error if anything went wrong
+// This function is kept to keep backwards copatibility of existing tests.
+// Better use (*Client).RunRangeQueryWithStartEnd()
 func (c *Client) RunRangeQuery(ctx context.Context, query string, extraHeaders ...Header) (*Response, error) {
+	end := c.Now.Add(time.Second)
+	start := c.Now.Add(-7 * 24 * time.Hour)
+	return c.RunRangeQueryWithStartEnd(ctx, query, start, end, extraHeaders...)
+}
+
+// RunRangeQuery runs a query and returns an error if anything went wrong
+func (c *Client) RunRangeQueryWithStartEnd(ctx context.Context, query string, start, end time.Time, extraHeaders ...Header) (*Response, error) {
 	ctx, cancelFunc := context.WithTimeout(ctx, requestTimeout)
 	defer cancelFunc()
 
-	buf, statusCode, err := c.run(ctx, c.rangeQueryURL(query), extraHeaders...)
+	buf, statusCode, err := c.run(ctx, c.rangeQueryURL(query, start, end), extraHeaders...)
 	if err != nil {
 		return nil, err
 	}
@@ -499,7 +509,7 @@ func (c *Client) RunQuery(ctx context.Context, query string, extraHeaders ...Hea
 
 	v := url.Values{}
 	v.Set("query", query)
-	v.Set("time", formatTS(c.Now.Add(time.Second)))
+	v.Set("time", FormatTS(c.Now.Add(time.Second)))
 
 	u, err := url.Parse(c.baseURL)
 	if err != nil {
@@ -555,11 +565,11 @@ func (c *Client) parseResponse(buf []byte, statusCode int) (*Response, error) {
 	return &lokiResp, nil
 }
 
-func (c *Client) rangeQueryURL(query string) string {
+func (c *Client) rangeQueryURL(query string, start, end time.Time) string {
 	v := url.Values{}
 	v.Set("query", query)
-	v.Set("start", formatTS(c.Now.Add(-7*24*time.Hour)))
-	v.Set("end", formatTS(c.Now.Add(time.Second)))
+	v.Set("start", FormatTS(start))
+	v.Set("end", FormatTS(end))
 
 	u, err := url.Parse(c.baseURL)
 	if err != nil {

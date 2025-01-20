@@ -21,7 +21,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 
-	"github.com/grafana/loki/pkg/storage/stores/shipper/indexshipper/tsdb/index"
+	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper/tsdb/index"
 )
 
 // Index returns an IndexReader against the block.
@@ -100,7 +100,7 @@ func (h *headIndexReader) LabelNames(matchers ...*labels.Matcher) ([]string, err
 }
 
 // Postings returns the postings list iterator for the label pairs.
-func (h *headIndexReader) Postings(name string, shard *index.ShardAnnotation, values ...string) (index.Postings, error) {
+func (h *headIndexReader) Postings(name string, fpFilter index.FingerprintFilter, values ...string) (index.Postings, error) {
 	var p index.Postings
 	switch len(values) {
 	case 0:
@@ -115,8 +115,8 @@ func (h *headIndexReader) Postings(name string, shard *index.ShardAnnotation, va
 		p = index.Merge(res...)
 	}
 
-	if shard != nil {
-		return index.NewShardedPostings(p, *shard, nil), nil
+	if fpFilter != nil {
+		return index.NewShardedPostings(p, fpFilter, nil), nil
 	}
 	return p, nil
 }
@@ -146,14 +146,23 @@ func (h *headIndexReader) Series(ref storage.SeriesRef, from int64, through int6
 	return s.fp, nil
 }
 
-func (h *headIndexReader) ChunkStats(ref storage.SeriesRef, from, through int64, lbls *labels.Labels) (uint64, index.ChunkStats, error) {
+func (h *headIndexReader) ChunkStats(ref storage.SeriesRef, from, through int64, lbls *labels.Labels, by map[string]struct{}) (uint64, index.ChunkStats, error) {
 	s := h.head.series.getByID(uint64(ref))
 
 	if s == nil {
 		h.head.metrics.seriesNotFound.Inc()
 		return 0, index.ChunkStats{}, storage.ErrNotFound
 	}
-	*lbls = append((*lbls)[:0], s.ls...)
+	if len(by) == 0 {
+		*lbls = append((*lbls)[:0], s.ls...)
+	} else {
+		*lbls = (*lbls)[:0]
+		for _, l := range s.ls {
+			if _, ok := by[l.Name]; ok {
+				*lbls = append(*lbls, l)
+			}
+		}
+	}
 
 	queryBounds := newBounds(model.Time(from), model.Time(through))
 

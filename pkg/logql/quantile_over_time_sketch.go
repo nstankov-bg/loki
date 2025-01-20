@@ -10,19 +10,20 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	promql_parser "github.com/prometheus/prometheus/promql/parser"
 
-	"github.com/grafana/loki/pkg/iter"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql/sketch"
-	"github.com/grafana/loki/pkg/logqlmodel"
-	"github.com/grafana/loki/pkg/queue"
+	"github.com/grafana/loki/v3/pkg/iter"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/sketch"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
 )
 
 const (
 	QuantileSketchMatrixType = "QuantileSketchMatrix"
 )
 
-type ProbabilisticQuantileVector []ProbabilisticQuantileSample
-type ProbabilisticQuantileMatrix []ProbabilisticQuantileVector
+type (
+	ProbabilisticQuantileVector []ProbabilisticQuantileSample
+	ProbabilisticQuantileMatrix []ProbabilisticQuantileVector
+)
 
 var streamHashPool = sync.Pool{
 	New: func() interface{} { return make(map[uint64]int) },
@@ -61,6 +62,10 @@ func (ProbabilisticQuantileVector) SampleVector() promql.Vector {
 
 func (q ProbabilisticQuantileVector) QuantileSketchVec() ProbabilisticQuantileVector {
 	return q
+}
+
+func (ProbabilisticQuantileVector) CountMinSketchVec() CountMinSketchVector {
+	return CountMinSketchVector{}
 }
 
 func (q ProbabilisticQuantileVector) ToProto() *logproto.QuantileSketchVector {
@@ -116,7 +121,6 @@ func (m ProbabilisticQuantileMatrix) Release() {
 	for _, vec := range m {
 		vec.Release()
 	}
-	quantileVectorPool.Put(m)
 }
 
 func (m ProbabilisticQuantileMatrix) ToProto() *logproto.QuantileSketchMatrix {
@@ -179,7 +183,8 @@ func (e *QuantileSketchStepEvaluator) Explain(parent Node) {
 
 func newQuantileSketchIterator(
 	it iter.PeekingSampleIterator,
-	selRange, step, start, end, offset int64) RangeVectorIterator {
+	selRange, step, start, end, offset int64,
+) RangeVectorIterator {
 	inner := &batchRangeVectorIterator{
 		iter:     it,
 		step:     step,
@@ -238,24 +243,20 @@ func probabilisticQuantileSampleFromProto(proto *logproto.QuantileSketchSample) 
 
 type quantileSketchBatchRangeVectorIterator struct {
 	*batchRangeVectorIterator
-	at []ProbabilisticQuantileSample
 }
 
 func (r *quantileSketchBatchRangeVectorIterator) At() (int64, StepResult) {
-	if r.at == nil {
-		r.at = make([]ProbabilisticQuantileSample, 0, len(r.window))
-	}
-	r.at = r.at[:0]
+	at := make([]ProbabilisticQuantileSample, 0, len(r.window))
 	// convert ts from nano to milli seconds as the iterator work with nanoseconds
 	ts := r.current/1e+6 + r.offset/1e+6
 	for _, series := range r.window {
-		r.at = append(r.at, ProbabilisticQuantileSample{
+		at = append(at, ProbabilisticQuantileSample{
 			F:      r.agg(series.Floats),
 			T:      ts,
 			Metric: series.Metric,
 		})
 	}
-	return ts, ProbabilisticQuantileVector(r.at)
+	return ts, ProbabilisticQuantileVector(at)
 }
 
 func (r *quantileSketchBatchRangeVectorIterator) agg(samples []promql.FPoint) sketch.QuantileSketch {
@@ -268,9 +269,6 @@ func (r *quantileSketchBatchRangeVectorIterator) agg(samples []promql.FPoint) sk
 	return s
 }
 
-// quantileVectorPool slice of ProbabilisticQuantileVector [64, 128, 256, ..., 65536]
-var quantileVectorPool = queue.NewSlicePool[ProbabilisticQuantileVector](1<<6, 1<<16, 2)
-
 // JoinQuantileSketchVector joins the results from stepEvaluator into a ProbabilisticQuantileMatrix.
 func JoinQuantileSketchVector(next bool, r StepResult, stepEvaluator StepEvaluator, params Params) (promql_parser.Value, error) {
 	vec := r.QuantileSketchVec()
@@ -278,13 +276,16 @@ func JoinQuantileSketchVector(next bool, r StepResult, stepEvaluator StepEvaluat
 		return nil, stepEvaluator.Error()
 	}
 
+	if GetRangeType(params) == InstantType {
+		return ProbabilisticQuantileMatrix{vec}, nil
+	}
+
 	stepCount := int(math.Ceil(float64(params.End().Sub(params.Start()).Nanoseconds()) / float64(params.Step().Nanoseconds())))
 	if stepCount <= 0 {
 		stepCount = 1
 	}
 
-	// The result is released to the pool when the matrix is serialized.
-	result := quantileVectorPool.Get(stepCount)
+	result := make(ProbabilisticQuantileMatrix, 0, stepCount)
 
 	for next {
 		result = append(result, vec)
@@ -295,7 +296,7 @@ func JoinQuantileSketchVector(next bool, r StepResult, stepEvaluator StepEvaluat
 		}
 	}
 
-	return ProbabilisticQuantileMatrix(result), stepEvaluator.Error()
+	return result, stepEvaluator.Error()
 }
 
 // QuantileSketchMatrixStepEvaluator steps through a matrix of quantile sketch
@@ -349,70 +350,6 @@ func (*QuantileSketchMatrixStepEvaluator) Explain(parent Node) {
 	parent.Child("QuantileSketchMatrix")
 }
 
-// QuantileSketchMergeStepEvaluator merges multiple quantile sketches into one for each
-// step.
-type QuantileSketchMergeStepEvaluator struct {
-	evaluators []StepEvaluator
-	err        error
-}
-
-func NewQuantileSketchMergeStepEvaluator(evaluators []StepEvaluator) *QuantileSketchMergeStepEvaluator {
-	return &QuantileSketchMergeStepEvaluator{
-		evaluators: evaluators,
-		err:        nil,
-	}
-}
-
-func (e *QuantileSketchMergeStepEvaluator) Next() (bool, int64, StepResult) {
-	ok, ts, r := e.evaluators[0].Next()
-	var cur ProbabilisticQuantileVector
-	if ok {
-		cur = r.QuantileSketchVec()
-	}
-
-	if len(e.evaluators) == 1 {
-		return ok, ts, cur
-	}
-
-	for _, eval := range e.evaluators[1:] {
-		ok, nextTs, vec := eval.Next()
-		if ok {
-			if cur == nil {
-				cur = vec.QuantileSketchVec()
-			} else {
-				if ts != nextTs {
-					e.err = fmt.Errorf("timestamps of sketches differ: %d!=%d", ts, nextTs)
-					return false, 0, nil
-				}
-
-				_, e.err = cur.Merge(vec.QuantileSketchVec())
-				if e.err != nil {
-					return false, 0, nil
-				}
-			}
-		}
-	}
-
-	return ok, ts, cur
-}
-
-func (*QuantileSketchMergeStepEvaluator) Close() error { return nil }
-
-func (e *QuantileSketchMergeStepEvaluator) Error() error { return e.err }
-
-func (e *QuantileSketchMergeStepEvaluator) Explain(parent Node) {
-	b := parent.Child("QuantileSketchMerge")
-	if len(e.evaluators) < MaxChildrenDisplay {
-		for _, child := range e.evaluators {
-			child.Explain(b)
-		}
-	} else {
-		e.evaluators[0].Explain(b)
-		b.Child("...")
-		e.evaluators[len(e.evaluators)-1].Explain(b)
-	}
-}
-
 // QuantileSketchVectorStepEvaluator evaluates a quantile sketch into a
 // promql.Vector.
 type QuantileSketchVectorStepEvaluator struct {
@@ -454,8 +391,3 @@ func (e *QuantileSketchVectorStepEvaluator) Next() (bool, int64, StepResult) {
 func (*QuantileSketchVectorStepEvaluator) Close() error { return nil }
 
 func (*QuantileSketchVectorStepEvaluator) Error() error { return nil }
-
-func (e *QuantileSketchVectorStepEvaluator) Explain(parent Node) {
-	b := parent.Child("QuantileSketchVector")
-	e.inner.Explain(b)
-}

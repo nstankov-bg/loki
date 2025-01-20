@@ -10,9 +10,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
-	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
+	lokiv1 "github.com/grafana/loki/operator/api/loki/v1"
 	"github.com/grafana/loki/operator/internal/manifests/internal/config"
 	"github.com/grafana/loki/operator/internal/manifests/openshift"
 )
@@ -118,7 +118,7 @@ func randomConfigOptions() Options {
 							Operator:          corev1.TolerationOpEqual,
 							Value:             uuid.New().String(),
 							Effect:            corev1.TaintEffectNoExecute,
-							TolerationSeconds: pointer.Int64(rand.Int63()),
+							TolerationSeconds: ptr.To[int64](rand.Int63()),
 						},
 					},
 				},
@@ -133,7 +133,7 @@ func randomConfigOptions() Options {
 							Operator:          corev1.TolerationOpEqual,
 							Value:             uuid.New().String(),
 							Effect:            corev1.TaintEffectNoExecute,
-							TolerationSeconds: pointer.Int64(rand.Int63()),
+							TolerationSeconds: ptr.To[int64](rand.Int63()),
 						},
 					},
 				},
@@ -148,7 +148,7 @@ func randomConfigOptions() Options {
 							Operator:          corev1.TolerationOpEqual,
 							Value:             uuid.New().String(),
 							Effect:            corev1.TaintEffectNoExecute,
-							TolerationSeconds: pointer.Int64(rand.Int63()),
+							TolerationSeconds: ptr.To[int64](rand.Int63()),
 						},
 					},
 				},
@@ -163,7 +163,7 @@ func randomConfigOptions() Options {
 							Operator:          corev1.TolerationOpEqual,
 							Value:             uuid.New().String(),
 							Effect:            corev1.TaintEffectNoExecute,
-							TolerationSeconds: pointer.Int64(rand.Int63()),
+							TolerationSeconds: ptr.To[int64](rand.Int63()),
 						},
 					},
 				},
@@ -178,7 +178,7 @@ func randomConfigOptions() Options {
 							Operator:          corev1.TolerationOpEqual,
 							Value:             uuid.New().String(),
 							Effect:            corev1.TaintEffectNoExecute,
-							TolerationSeconds: pointer.Int64(rand.Int63()),
+							TolerationSeconds: ptr.To[int64](rand.Int63()),
 						},
 					},
 				},
@@ -193,7 +193,7 @@ func randomConfigOptions() Options {
 							Operator:          corev1.TolerationOpEqual,
 							Value:             uuid.New().String(),
 							Effect:            corev1.TaintEffectNoExecute,
-							TolerationSeconds: pointer.Int64(rand.Int63()),
+							TolerationSeconds: ptr.To[int64](rand.Int63()),
 						},
 					},
 				},
@@ -320,7 +320,6 @@ func TestConfigOptions_GossipRingConfig(t *testing.T) {
 		},
 	}
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -429,7 +428,6 @@ func TestConfigOptions_RetentionConfig(t *testing.T) {
 	}
 
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -520,7 +518,6 @@ func TestConfigOptions_RulerAlertManager(t *testing.T) {
 	}
 
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -640,7 +637,6 @@ func TestConfigOptions_RulerAlertManager_UserOverride(t *testing.T) {
 	}
 
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -723,12 +719,12 @@ func TestConfigOptions_RulerOverrides_OCPApplicationTenant(t *testing.T) {
 							RefreshInterval: "1m",
 							Notifier: &config.NotifierConfig{
 								TLS: config.TLSConfig{
-									ServerName: pointer.String("alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"),
-									CAPath:     pointer.String("/var/run/ca/alertmanager/service-ca.crt"),
+									ServerName: ptr.To("alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"),
+									CAPath:     ptr.To("/var/run/ca/alertmanager/service-ca.crt"),
 								},
 								HeaderAuth: config.HeaderAuth{
-									Type:            pointer.String("Bearer"),
-									CredentialsFile: pointer.String("/var/run/secrets/kubernetes.io/serviceaccount/token"),
+									Type:            ptr.To("Bearer"),
+									CredentialsFile: ptr.To("/var/run/secrets/kubernetes.io/serviceaccount/token"),
 								},
 							},
 						},
@@ -771,7 +767,6 @@ func TestConfigOptions_RulerOverrides_OCPApplicationTenant(t *testing.T) {
 	}
 
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -848,14 +843,14 @@ func TestConfigOptions_RulerOverrides(t *testing.T) {
 									},
 									Client: &lokiv1.AlertManagerClientConfig{
 										TLS: &lokiv1.AlertManagerClientTLSConfig{
-											ServerName: pointer.String("application.svc"),
-											CAPath:     pointer.String("/tenant/application/alertmanager/ca.crt"),
-											CertPath:   pointer.String("/tenant/application/alertmanager/cert.crt"),
-											KeyPath:    pointer.String("/tenant/application/alertmanager/cert.key"),
+											ServerName: ptr.To("application.svc"),
+											CAPath:     ptr.To("/tenant/application/alertmanager/ca.crt"),
+											CertPath:   ptr.To("/tenant/application/alertmanager/cert.crt"),
+											KeyPath:    ptr.To("/tenant/application/alertmanager/cert.key"),
 										},
 										HeaderAuth: &lokiv1.AlertManagerClientHeaderAuth{
-											Type:        pointer.String("Bearer"),
-											Credentials: pointer.String("letmeinplz"),
+											Type:        ptr.To("Bearer"),
+											Credentials: ptr.To("letmeinplz"),
 										},
 									},
 								},
@@ -872,14 +867,14 @@ func TestConfigOptions_RulerOverrides(t *testing.T) {
 									},
 									Client: &lokiv1.AlertManagerClientConfig{
 										TLS: &lokiv1.AlertManagerClientTLSConfig{
-											ServerName: pointer.String("other.svc"),
-											CAPath:     pointer.String("/tenant/other/alertmanager/ca.crt"),
-											CertPath:   pointer.String("/tenant/other/alertmanager/cert.crt"),
-											KeyPath:    pointer.String("/tenant/other/alertmanager/cert.key"),
+											ServerName: ptr.To("other.svc"),
+											CAPath:     ptr.To("/tenant/other/alertmanager/ca.crt"),
+											CertPath:   ptr.To("/tenant/other/alertmanager/cert.crt"),
+											KeyPath:    ptr.To("/tenant/other/alertmanager/cert.key"),
 										},
 										BasicAuth: &lokiv1.AlertManagerClientBasicAuth{
-											Username: pointer.String("user"),
-											Password: pointer.String("pass"),
+											Username: ptr.To("user"),
+											Password: ptr.To("pass"),
 										},
 									},
 								},
@@ -906,14 +901,14 @@ func TestConfigOptions_RulerOverrides(t *testing.T) {
 							ExternalLabels:  map[string]string{"external": "label"},
 							Notifier: &config.NotifierConfig{
 								TLS: config.TLSConfig{
-									ServerName: pointer.String("application.svc"),
-									CAPath:     pointer.String("/tenant/application/alertmanager/ca.crt"),
-									CertPath:   pointer.String("/tenant/application/alertmanager/cert.crt"),
-									KeyPath:    pointer.String("/tenant/application/alertmanager/cert.key"),
+									ServerName: ptr.To("application.svc"),
+									CAPath:     ptr.To("/tenant/application/alertmanager/ca.crt"),
+									CertPath:   ptr.To("/tenant/application/alertmanager/cert.crt"),
+									KeyPath:    ptr.To("/tenant/application/alertmanager/cert.key"),
 								},
 								HeaderAuth: config.HeaderAuth{
-									Type:        pointer.String("Bearer"),
-									Credentials: pointer.String("letmeinplz"),
+									Type:        ptr.To("Bearer"),
+									Credentials: ptr.To("letmeinplz"),
 								},
 							},
 						},
@@ -930,14 +925,14 @@ func TestConfigOptions_RulerOverrides(t *testing.T) {
 							ExternalLabels:  map[string]string{"external1": "label1"},
 							Notifier: &config.NotifierConfig{
 								TLS: config.TLSConfig{
-									ServerName: pointer.String("other.svc"),
-									CAPath:     pointer.String("/tenant/other/alertmanager/ca.crt"),
-									CertPath:   pointer.String("/tenant/other/alertmanager/cert.crt"),
-									KeyPath:    pointer.String("/tenant/other/alertmanager/cert.key"),
+									ServerName: ptr.To("other.svc"),
+									CAPath:     ptr.To("/tenant/other/alertmanager/ca.crt"),
+									CertPath:   ptr.To("/tenant/other/alertmanager/cert.crt"),
+									KeyPath:    ptr.To("/tenant/other/alertmanager/cert.key"),
 								},
 								BasicAuth: config.BasicAuth{
-									Username: pointer.String("user"),
-									Password: pointer.String("pass"),
+									Username: ptr.To("user"),
+									Password: ptr.To("pass"),
 								},
 							},
 						},
@@ -980,7 +975,6 @@ func TestConfigOptions_RulerOverrides(t *testing.T) {
 	}
 
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -1072,12 +1066,12 @@ func TestConfigOptions_RulerOverrides_OCPUserWorkloadOnlyEnabled(t *testing.T) {
 							RefreshInterval: "1m",
 							Notifier: &config.NotifierConfig{
 								TLS: config.TLSConfig{
-									ServerName: pointer.String("alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"),
-									CAPath:     pointer.String("/var/run/ca/alertmanager/service-ca.crt"),
+									ServerName: ptr.To("alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"),
+									CAPath:     ptr.To("/var/run/ca/alertmanager/service-ca.crt"),
 								},
 								HeaderAuth: config.HeaderAuth{
-									Type:            pointer.String("Bearer"),
-									CredentialsFile: pointer.String("/var/run/secrets/kubernetes.io/serviceaccount/token"),
+									Type:            ptr.To("Bearer"),
+									CredentialsFile: ptr.To("/var/run/secrets/kubernetes.io/serviceaccount/token"),
 								},
 							},
 						},
@@ -1150,12 +1144,12 @@ func TestConfigOptions_RulerOverrides_OCPUserWorkloadOnlyEnabled(t *testing.T) {
 							RefreshInterval: "1m",
 							Notifier: &config.NotifierConfig{
 								TLS: config.TLSConfig{
-									ServerName: pointer.String("alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"),
-									CAPath:     pointer.String("/var/run/ca/alertmanager/service-ca.crt"),
+									ServerName: ptr.To("alertmanager-user-workload.openshift-user-workload-monitoring.svc.cluster.local"),
+									CAPath:     ptr.To("/var/run/ca/alertmanager/service-ca.crt"),
 								},
 								HeaderAuth: config.HeaderAuth{
-									Type:            pointer.String("Bearer"),
-									CredentialsFile: pointer.String("/var/run/secrets/kubernetes.io/serviceaccount/token"),
+									Type:            ptr.To("Bearer"),
+									CredentialsFile: ptr.To("/var/run/secrets/kubernetes.io/serviceaccount/token"),
 								},
 							},
 						},
@@ -1205,7 +1199,6 @@ func TestConfigOptions_RulerOverrides_OCPUserWorkloadOnlyEnabled(t *testing.T) {
 	}
 
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -1299,7 +1292,6 @@ func TestConfigOptions_Replication(t *testing.T) {
 	}
 
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 

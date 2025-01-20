@@ -19,11 +19,11 @@ import (
 
 	"github.com/grafana/dskit/tenant"
 
-	"github.com/grafana/loki/pkg/logqlmodel/stats"
-	"github.com/grafana/loki/pkg/storage/chunk/cache"
-	"github.com/grafana/loki/pkg/util/math"
-	"github.com/grafana/loki/pkg/util/spanlogger"
-	"github.com/grafana/loki/pkg/util/validation"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/util/math"
+	"github.com/grafana/loki/v3/pkg/util/validation"
 )
 
 // ConstSplitter is a utility for using a constant split interval when determining cache keys
@@ -50,7 +50,7 @@ type ResultsCache struct {
 	next                 Handler
 	cache                cache.Cache
 	limits               Limits
-	splitter             KeyGenerator
+	keyGen               KeyGenerator
 	cacheGenNumberLoader CacheGenNumberLoader
 	retentionEnabled     bool
 	extractor            Extractor
@@ -58,6 +58,7 @@ type ResultsCache struct {
 	merger               ResponseMerger
 	shouldCacheReq       ShouldCacheReqFn
 	shouldCacheRes       ShouldCacheResFn
+	onlyUseEntireExtent  bool
 	parallelismForReq    func(ctx context.Context, tenantIDs []string, r Request) int
 }
 
@@ -79,14 +80,14 @@ func NewResultsCache(
 	shouldCacheRes ShouldCacheResFn,
 	parallelismForReq func(ctx context.Context, tenantIDs []string, r Request) int,
 	cacheGenNumberLoader CacheGenNumberLoader,
-	retentionEnabled bool,
+	retentionEnabled, onlyUseEntireExtent bool,
 ) *ResultsCache {
 	return &ResultsCache{
 		logger:               logger,
 		next:                 next,
 		cache:                c,
 		limits:               limits,
-		splitter:             keyGen,
+		keyGen:               NewPipelineWrapperKeygen(keyGen),
 		cacheGenNumberLoader: cacheGenNumberLoader,
 		retentionEnabled:     retentionEnabled,
 		extractor:            extractor,
@@ -95,6 +96,7 @@ func NewResultsCache(
 		shouldCacheReq:       shouldCacheReq,
 		shouldCacheRes:       shouldCacheRes,
 		parallelismForReq:    parallelismForReq,
+		onlyUseEntireExtent:  onlyUseEntireExtent,
 	}
 }
 
@@ -103,7 +105,7 @@ func (s ResultsCache) Do(ctx context.Context, r Request) (Response, error) {
 	defer sp.Finish()
 	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
 	if s.shouldCacheReq != nil && !s.shouldCacheReq(ctx, r) {
@@ -115,7 +117,7 @@ func (s ResultsCache) Do(ctx context.Context, r Request) (Response, error) {
 	}
 
 	var (
-		key      = s.splitter.GenerateCacheKey(ctx, tenant.JoinTenantIDs(tenantIDs), r)
+		key      = s.keyGen.GenerateCacheKey(ctx, tenant.JoinTenantIDs(tenantIDs), r)
 		extents  []Extent
 		response Response
 	)
@@ -181,8 +183,6 @@ func (s ResultsCache) handleHit(ctx context.Context, r Request, extents []Extent
 	)
 	sp, ctx := opentracing.StartSpanFromContext(ctx, "handleHit")
 	defer sp.Finish()
-	log := spanlogger.FromContext(ctx)
-	defer log.Finish()
 
 	requests, responses, err := s.partition(r, extents)
 	if err != nil {
@@ -200,7 +200,7 @@ func (s ResultsCache) handleHit(ctx context.Context, r Request, extents []Extent
 
 	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
-		return nil, nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 	reqResps, err = DoRequests(ctx, s.next, requests, s.parallelismForReq(ctx, tenantIDs, r))
 
@@ -289,10 +289,10 @@ func merge(extents []Extent, acc *accumulator) ([]Extent, error) {
 		return nil, err
 	}
 	return append(extents, Extent{
-		Start:    acc.Extent.Start,
-		End:      acc.Extent.End,
+		Start:    acc.Start,
+		End:      acc.End,
 		Response: anyResp,
-		TraceId:  acc.Extent.TraceId,
+		TraceId:  acc.TraceId,
 	}), nil
 }
 
@@ -334,6 +334,25 @@ func (s ResultsCache) partition(req Request, extents []Extent) ([]Request, []Res
 			continue
 		}
 
+		if s.onlyUseEntireExtent && (start > extent.GetStart() || end < extent.GetEnd()) {
+			// It is not possible to extract the overlapping portion of an extent for all request types.
+			// Metadata results for one cannot be extracted as the data portion is just a list of strings with no associated timestamp.
+			// To avoid returning incorrect results, we only use extents that are entirely within the requested query range.
+			//
+			//	Start                  End
+			//	┌────────────────────────┐
+			//	│          Req           │
+			//	└────────────────────────┘
+			//
+			//          ◄──────────────►               only this extent can be used. Remaining portion of the query will be added to requests.
+			//
+			//
+			//   ◄──────X───────►                      cannot be partially extracted. will be discarded if onlyUseEntireExtent is set.
+			//                       ◄───────X──────►
+			//   ◄───────────────X──────────────────►
+			continue
+		}
+
 		// If this extent is tiny and request is not tiny, discard it: more efficient to do a few larger queries.
 		// Hopefully tiny request can make tiny extent into not-so-tiny extent.
 
@@ -353,6 +372,7 @@ func (s ResultsCache) partition(req Request, extents []Extent) ([]Request, []Res
 		if err != nil {
 			return nil, nil, err
 		}
+
 		// extract the overlap from the cached extent.
 		cachedResponses = append(cachedResponses, s.extractor.Extract(start, end, res, extent.GetStart(), extent.GetEnd()))
 		start = extent.End
@@ -366,7 +386,7 @@ func (s ResultsCache) partition(req Request, extents []Extent) ([]Request, []Res
 
 	// If start and end are the same (valid in promql), start == req.GetEnd() and we won't do the query.
 	// But we should only do the request if we don't have a valid cached response for it.
-	if req.GetStart() == req.GetEnd() && len(cachedResponses) == 0 {
+	if req.GetStart().Equal(req.GetEnd()) && len(cachedResponses) == 0 {
 		requests = append(requests, req)
 	}
 
@@ -404,14 +424,11 @@ func (s ResultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
 	var resp CachedResponse
 	sp, ctx := opentracing.StartSpanFromContext(ctx, "unmarshal-extent") //nolint:ineffassign,staticcheck
 	defer sp.Finish()
-	log := spanlogger.FromContext(ctx)
-	defer log.Finish()
 
-	log.LogFields(otlog.Int("bytes", len(bufs[0])))
+	sp.LogFields(otlog.Int("bytes", len(bufs[0])))
 
 	if err := proto.Unmarshal(bufs[0], &resp); err != nil {
-		level.Error(log).Log("msg", "error unmarshalling cached value", "err", err)
-		log.Error(err)
+		level.Error(util_log.Logger).Log("msg", "error unmarshalling cached value", "err", err)
 		return nil, false
 	}
 
